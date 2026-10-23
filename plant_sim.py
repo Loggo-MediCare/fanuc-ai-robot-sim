@@ -2,7 +2,7 @@
 
 在背景執行緒中每 10 ms 掃描一次，行為對應以下梯形圖邏輯：
 
-    PERMIT   = DOOR_CLOSED AND NOT ALARM AND ROBOT_READY
+    PERMIT   = DOOR_CLOSED AND NOT ALARM AND ROBOT_READY AND COMM_OK
     ACCEPT   = PICK_REQ AND PERMIT AND NOT BUSY AND NOT DONE  → 鎖存 BUSY，機械手臂開始動作
     REJECT   = PICK_REQ AND NOT PERMIT AND NOT BUSY
     ABORT    = BUSY AND NOT PERMIT                            → 機械手臂停止，設 FAULT
@@ -28,6 +28,7 @@ class SimulatedPlant:
         self.door_closed = True
         self.alarm = False
         self.robot_ready = True
+        self.comm_ok = True   # 上位端心跳正常（由 OPC UA 閘道的看門狗設定）
         # PLC 內部狀態
         self._busy = False
         self._done = False
@@ -55,7 +56,7 @@ class SimulatedPlant:
 
     def scan(self):
         pick_req = bool(self.pmc.read_short(R_COMMAND) & CMD_PICK_REQ)
-        permit = self.door_closed and not self.alarm and self.robot_ready
+        permit = self.door_closed and not self.alarm and self.robot_ready and self.comm_ok
         rejected = False
 
         if self._busy:

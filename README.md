@@ -1,6 +1,6 @@
 # FANUC PMC + AI 機械手臂模擬（第 1 步）
 
-純 Python 模擬，不需 Jetson、不需 FANUC 控制器、不需安裝任何套件（Python 3.8+）。
+純 Python 模擬，不需 Jetson、不需 FANUC 控制器。第 1 步不需安裝任何套件（Python 3.8+）；第 2 步 OPC UA 需要 `asyncua`。
 
 分工原則：**AI 負責「看見、判斷、提出請求」；PLC 負責「確認條件、允許動作」；機械手臂控制器負責「實際移動」。** AI 的判斷不能取代緊急停止或安全互鎖。
 
@@ -58,9 +58,72 @@ DONE   = 手臂動作完成                                    → 鎖存到 PIC
 | 6. 動作中安全門被打開 | `FAULT`（PLC 中止動作） |
 | 7. 動作中 PLC 通訊中斷 | `COMM_ERROR` |
 
+## 第 2 步：OPC UA 雙向通訊（Jetson = Client，PLC = Server）
+
+需要 `python -m pip install -r requirements.txt`（asyncua）。
+
+```
+python demo_opcua.py              # 5 個情境
+python -m unittest test_opcua -v  # 5 個測試
+```
+
+### 第二堂課程範例（`lesson/`）
+
+```
+python lesson/plc_server.py       # 終端機 1
+python lesson/jetson_client.py    # 終端機 2 → Robot Ready: True / Robot Alarm: False / AI may propose a pick request
+```
+
+### 架構
+
+```
+Jetson Python（OPC UA Client）          OPC UA 閘道（Server）            PLC 梯形圖＋機械手臂
+  controller.py（未修改）                opcua_gateway.py                 plant_sim.py
+  └ opcua_pmc.py ──── Ethernet / OPC UA ──► Robot.* Node ◄──► R100/R101 ──► PERMIT / ACCEPT / ABORT
+       └ 心跳執行緒，每 0.1 s 寫 Robot.Heartbeat      └ 看門狗：0.5 s 沒變 → COMM_OK = False
+```
+
+`opcua_pmc.py` 實作和 `SimulatedPMC` 相同的 `read_short` / `write_short` 介面，所以 `controller.py` 一行都不用改，正好驗證第 1 步「只換 PMC 實作」的設計。
+
+### Node 一覽（教學用名稱，不是 FANUC 內建 Node）
+
+| Node | 類型 | 方向 | Client 可寫 | 對應 R 區 |
+|---|---|---|---|---|
+| `Robot.Ready` | Boolean | PLC → Jetson | 否 | R101 bit2 |
+| `Robot.DoorClosed` | Boolean | PLC → Jetson | 否 | R101 bit0 |
+| `Robot.Alarm` | Boolean | PLC → Jetson | 否 | R101 bit1 |
+| `Robot.PickAccepted` | Boolean | PLC → Jetson | 否 | R101 bit3 |
+| `Robot.PickDone` | Boolean | PLC → Jetson | 否 | R101 bit4 |
+| `Robot.PickRejected` | Boolean | PLC → Jetson | 否 | R101 bit5 |
+| `Robot.Fault` | Boolean | PLC → Jetson | 否 | R101 bit6 |
+| `Robot.PickRequest` | Boolean | Jetson → PLC | **是** | R100 bit0 |
+| `Robot.Heartbeat` | UInt32 | Jetson → PLC | **是** | （閘道內部看門狗） |
+
+### 情境與結果
+
+| 情境 | 結果 |
+|---|---|
+| 1. 正常抓取（寫 PickRequest → PLC 回 PickDone） | `PICK_DONE` |
+| 2. 安全門開啟 | `BLOCKED` |
+| 3. 動作中安全門被打開 | `FAULT` |
+| 4. Client 嘗試寫入 `Alarm`、`PickDone`、`DoorClosed` | 伺服端回 `BadUserAccessDenied`；只有 `PickRequest` 寫入成功 |
+| 5. 動作中 Jetson 程式卡死（心跳停止） | PLC 看門狗 0.5 s 後中止手臂、設 Fault，並取消失聯 Client 的 PickRequest |
+
+情境 5 補上了第 1 步情境 7 的缺口：現在 PLC 端自己知道上位端失聯，不需要上位端回報。
+
+### 安全性提醒
+
+本範例使用 `127.0.0.1`、`NoSecurity`（不加密、不驗證身分），**只適合同一台電腦練習**。跨機器部署時需要：可信任憑證、`SignAndEncrypt` 安全策略、使用者帳號與權限、網路隔離。AI 通訊系統不能取代獨立的安全互鎖與緊急停止。
+
+### 接真正的 FANUC 之前要確認
+
+1. 控制器是否原生提供 OPC UA Server，或需要 Gateway（FANUC FASOPC 定位為 CNC 資料擷取，不能假設可寫入任意 PMC 或下達手臂動作）。
+2. 哪些 Node 可讀、哪些可寫。
+3. 機械手臂控制器接受什麼動作請求。
+4. 安全互鎖與緊急停止如何獨立於 AI 通訊系統運作。
+
 ## 下一步
 
-1. **PLC 端心跳（watchdog）**：情境 7 中上位端知道斷線，但 PLC 端不知道。真實系統需由 Python 定期翻轉一個心跳位元，PLC 偵測停止翻轉即中止動作。
-2. 把 `SimulatedVision` 換成真實攝影機＋模型推論。
-3. 把 `SimulatedPMC` 換成 FOCAS 實作（需確認控制器型號與選配是否支援）。
-4. 包成 ROS 2 node，接 Isaac Sim 機械手臂模擬。
+1. 把 `SimulatedVision` 換成 NVIDIA Jetson 上的攝影機＋影像辨識模型。
+2. 依實際控制器，把 `opcua_gateway.py` 換成真正的 OPC UA Server，或把 `SimulatedPMC` 換成 FOCAS 實作。
+3. 包成 ROS 2 node，接 Isaac Sim 機械手臂模擬。
